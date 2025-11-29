@@ -40,10 +40,7 @@ def main():
     client = OpenAILLMClient()
 
     # ---------- LOGGING SETUP ----------
-    # Create logs/ folder if it does not exist
     os.makedirs("logs", exist_ok=True)
-
-    # Create a unique log filename for this run
     log_filename = os.path.join(
         "logs",
         f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
@@ -58,18 +55,34 @@ def main():
         "Focus on reasoning, not just giving them code."
     )
 
-    print("ASTRA tutor demo. Type 'quit' to exit.\n")
+    print("ASTRA group tutor demo. Type 'quit' to exit.\n")
+    print("Type messages as either:\n"
+          "  A: your message here\n"
+          "  B: your message here\n")
 
     while True:
-        user_input = input("Student_A: ")
-        if user_input.strip().lower() in {"quit", "exit"}:
+        user_input = input("> ").strip()
+        if user_input.lower() in {"quit", "exit"}:
             print("Goodbye.")
             break
 
+        # ---------- PARSE WHICH STUDENT IS SPEAKING ----------
+        if user_input.startswith("A:") or user_input.startswith("a:"):
+            student_id = "student_A"
+            content = user_input[2:].strip()
+        elif user_input.startswith("B:") or user_input.startswith("b:"):
+            student_id = "student_B"
+            content = user_input[2:].strip()
+        else:
+            # Default to student_A if no prefix is given
+            student_id = "student_A"
+            content = user_input
+        # -----------------------------------------------------
+
         msg = Message(
-            sender_id="student_A",
+            sender_id=student_id,
             sender_role="student",
-            content=user_input,
+            content=content,
         )
 
         casm, history, agent_resp = handle_turn(
@@ -79,10 +92,14 @@ def main():
             casm=casm,
             participant_ids=participants,
             task_context=task_context,
+            cga_frequency=4,  # CGA tries to intervene every 4 student turns
         )
 
         if agent_resp:
-            label = "Tutor" if agent_resp.agent_role == "pta" else "Facilitator"
+            if agent_resp.agent_role == "pta":
+                label = "Tutor"
+            else:
+                label = "Facilitator"  # CGA
             print(f"{label} [{agent_resp.action_tag}]: {agent_resp.content}\n")
         else:
             print("(No response from agent.)\n")

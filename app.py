@@ -1,4 +1,4 @@
-# Streamlit UI for ASTRA group tutor with multiple students and tasks
+# Streamlit UI for ASTRA group tutor with multiple students, tasks, conditions, and logging
 
 import os
 import json
@@ -10,9 +10,8 @@ from openai import OpenAI
 from astra_backend import LLMClient, CASMState, Message, handle_turn
 
 
-# ---------- CONFIG: STUDENTS AND TASKS ----------
+# ---------- CONFIG: STUDENTS, TASKS, CONDITIONS ----------
 
-# You can add or remove students here
 STUDENTS = {
     "Student A": "student_A",
     "Student B": "student_B",
@@ -20,7 +19,6 @@ STUDENTS = {
     "Student D": "student_D",
 }
 
-# You can add more tasks here by following the same structure
 TASKS = {
     "Task 1: Sum numbers from 1 to n": {
         "context": (
@@ -72,6 +70,11 @@ TASKS = {
     },
 }
 
+CONDITIONS = {
+    "Single-agent tutor (PTA only)": "pta_only",
+    "Multi-agent tutor (PTA + CGA)": "pta_cga",
+}
+
 
 # ---------- LLM CLIENT ----------
 
@@ -101,16 +104,24 @@ def init_state():
         st.session_state.initialised = True
 
         default_task = list(TASKS.keys())[0]
+        default_condition_label = list(CONDITIONS.keys())[0]
+        default_condition_code = CONDITIONS[default_condition_label]
 
         st.session_state.client = OpenAILLMClient()
         st.session_state.casm = CASMState()
         st.session_state.history = []
-        # All student ids from STUDENTS mapping
+        # all student ids
         st.session_state.participants = list(STUDENTS.values())
 
         st.session_state.selected_task = default_task
         st.session_state.task_context = TASKS[default_task]["context"]
         st.session_state.task_description = TASKS[default_task]["description"]
+
+        st.session_state.condition_label = default_condition_label
+        st.session_state.condition_code = default_condition_code
+
+        # researcher will type this per group
+        st.session_state.group_id = ""
 
         os.makedirs("logs", exist_ok=True)
         st.session_state.log_filename = os.path.join(
@@ -118,7 +129,7 @@ def init_state():
             f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl",
         )
 
-        # Chat history: list of dicts {role, name, text}
+        # chat history for display: list of dicts {"role", "name", "text"}
         st.session_state.chat = []
 
 
@@ -132,12 +143,12 @@ def main():
     with st.sidebar:
         st.header("About ASTRA")
         st.write(
-            "You are interacting with **ASTRA**, a socially intelligent AI tutor "
+            "You are interacting with ASTRA, a socially intelligent AI tutor "
             "designed to support small groups working on programming problems."
         )
         st.write(
-            "- **Tutor** messages focus on hints, questions, and explanations.\n"
-            "- **Facilitator** messages focus on how you collaborate as a group "
+            "- Tutor messages focus on hints, questions, and explanations.\n"
+            "- Facilitator messages focus on how you collaborate as a group "
             "(who speaks, who explains, whether you summarise, etc.)."
         )
         st.caption(
@@ -145,26 +156,52 @@ def main():
             "Your interactions may be logged for research and evaluation."
         )
 
-    # Title and instructions
     st.title("ASTRA Group Tutor 🧠")
 
     st.markdown(
+        "### Session setup\n\n"
+        "Before you start, please enter your group identifier and confirm your condition."
+    )
+
+    # Group ID and condition selection (for the researcher / instructor)
+    col1, col2 = st.columns(2)
+    with col1:
+        group_id_input = st.text_input(
+            "Group ID (e.g. G01, LabA3)",
+            value=st.session_state.group_id,
+        )
+    with col2:
+        condition_label = st.selectbox(
+            "Condition",
+            options=list(CONDITIONS.keys()),
+            index=list(CONDITIONS.keys()).index(st.session_state.condition_label),
+        )
+
+    # Update session state
+    st.session_state.group_id = group_id_input.strip()
+    st.session_state.condition_label = condition_label
+    st.session_state.condition_code = CONDITIONS[condition_label]
+
+    st.markdown(
         "### How to use this tool\n\n"
-        "1. Work in a small group as **Student A, Student B, Student C, Student D** (or fewer).\n"
+        "1. Work in a small group as Student A, Student B, Student C and Student D (or fewer).\n"
         "2. Select the programming task you are working on.\n"
         "3. Read the task description carefully.\n"
         "4. Choose who is speaking before sending each message.\n"
         "5. Type your message explaining your thinking, code, or questions.\n"
-        "6. The **Tutor** helps with the programming content; the **Facilitator** "
+        "6. The Tutor helps with the programming content; the Facilitator "
         "helps you collaborate effectively.\n\n"
         "Try to explain your reasoning to each other, not just ask for the final answer."
     )
 
     # ----- Task selection and description -----
+    st.markdown("---")
     task_names = list(TASKS.keys())
     current_index = task_names.index(st.session_state.selected_task)
     selected_task = st.selectbox(
-        "Choose your task:", options=task_names, index=current_index
+        "Choose your task:",
+        options=task_names,
+        index=current_index,
     )
 
     if selected_task != st.session_state.selected_task:
@@ -179,7 +216,7 @@ def main():
 
     # Show chat history
     for msg in st.session_state.chat:
-        role = msg["role"]          # "student" or "agent"
+        role = msg["role"]
         name = msg.get("name", "")
         text = msg["text"]
 
@@ -193,7 +230,7 @@ def main():
 
     st.markdown("---")
 
-    # Who is speaking now? (any of the configured students)
+    # Who is speaking now?
     student_labels = list(STUDENTS.keys())
     speaker = st.radio(
         "Who is speaking?",
@@ -202,14 +239,18 @@ def main():
         horizontal=True,
     )
 
-    # Input box
     user_input = st.chat_input("Type your message and press Enter")
 
     if user_input:
-        # Map display name to internal student id
         student_id = STUDENTS[speaker]
 
         msg = Message(sender_id=student_id, sender_role="student", content=user_input)
+
+        # Decide CGA frequency based on condition
+        if st.session_state.condition_code == "pta_only":
+            cga_frequency = None
+        else:
+            cga_frequency = 4
 
         casm, history, agent_resp = handle_turn(
             client=st.session_state.client,
@@ -218,19 +259,18 @@ def main():
             casm=st.session_state.casm,
             participant_ids=st.session_state.participants,
             task_context=st.session_state.task_context,
-            cga_frequency=4,
+            cga_frequency=cga_frequency,
         )
 
-        # Update state
         st.session_state.casm = casm
         st.session_state.history = history
 
-        # Add student message
+        # Add student message to display
         st.session_state.chat.append(
             {"role": "student", "name": speaker, "text": user_input}
         )
 
-        # Add agent message if any
+        # Add agent message to display
         if agent_resp:
             label = "Tutor" if agent_resp.agent_role == "pta" else "Facilitator"
             st.session_state.chat.append(
@@ -244,7 +284,10 @@ def main():
         # Log this turn
         record = {
             "timestamp": msg.timestamp,
+            "group_id": st.session_state.group_id,
+            "condition": st.session_state.condition_code,
             "student_id": msg.sender_id,
+            "student_label": speaker,
             "student_msg": msg.content,
             "agent_role": agent_resp.agent_role if agent_resp else None,
             "agent_action": agent_resp.action_tag if agent_resp else None,
@@ -254,7 +297,6 @@ def main():
         with open(st.session_state.log_filename, "a") as f:
             f.write(json.dumps(record) + "\n")
 
-        # Refresh UI with new messages
         st.rerun()
 
 
