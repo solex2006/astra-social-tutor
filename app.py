@@ -1,4 +1,4 @@
-# Minimal but functional Streamlit ASTRA UI with two tasks
+# Streamlit UI for ASTRA group tutor with two tasks and logging
 
 import os
 import json
@@ -91,7 +91,7 @@ def init_state():
             f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl",
         )
 
-        st.session_state.chat = []
+        st.session_state.chat = []  # list of dicts: {role, name, text}
 
 
 # ---------- MAIN APP ----------
@@ -100,14 +100,39 @@ def main():
     st.set_page_config(page_title="ASTRA Group Tutor", page_icon="🧠")
     init_state()
 
-    st.title("ASTRA Group Tutor")
+    # Sidebar with study info
+    with st.sidebar:
+        st.header("About ASTRA")
+        st.write(
+            "You are interacting with **ASTRA**, a socially intelligent AI tutor "
+            "designed to support small groups working on programming problems."
+        )
+        st.write(
+            "- **Tutor** messages focus on hints, questions, and explanations.\n"
+            "- **Facilitator** messages focus on how you collaborate as a pair "
+            "(who speaks, who explains, whether you summarise, etc.)."
+        )
+        st.caption(
+            "Please avoid sharing personal or sensitive information. "
+            "Your interactions may be logged for research and evaluation."
+        )
 
-    st.write(
-        "Work in a pair as Student A and Student B. Select a task, read it, "
-        "then discuss your ideas with the AI Tutor and Facilitator."
+    # Title and instructions
+    st.title("ASTRA Group Tutor 🧠")
+
+    st.markdown(
+        "### How to use this tool\n\n"
+        "1. Work in a pair as **Student A** and **Student B**.\n"
+        "2. Select the programming task you are working on.\n"
+        "3. Read the task description carefully.\n"
+        "4. Choose who is speaking (Student A or Student B).\n"
+        "5. Type your message explaining your thinking, code, or questions.\n"
+        "6. The **Tutor** helps with the programming content; the **Facilitator** "
+        "helps you collaborate effectively.\n\n"
+        "Try to explain your reasoning to each other, not just ask for the final answer."
     )
 
-    # Task selection
+    # ----- Task selection and description -----
     task_names = list(TASKS.keys())
     current_index = task_names.index(st.session_state.selected_task)
     selected_task = st.selectbox(
@@ -126,20 +151,34 @@ def main():
 
     # Show chat history
     for msg in st.session_state.chat:
-        role = msg["role"]
+        role = msg["role"]          # "student" or "agent"
         name = msg.get("name", "")
         text = msg["text"]
-        st.markdown(f"**{name} ({role}):** {text}")
+
+        if role == "student":
+            # Student messages
+            st.markdown(f"**{name}:** {text}")
+        else:
+            # Tutor / Facilitator messages – highlight label
+            st.markdown(
+                f"<span style='color:#1f4e79; font-weight:bold;'>{name}:</span> {text}",
+                unsafe_allow_html=True,
+            )
 
     st.markdown("---")
 
+    # Who is speaking now?
     speaker = st.radio(
-        "Who is speaking?", options=["Student A", "Student B"], horizontal=True
+        "Who is speaking?",
+        options=["Student A", "Student B"],
+        horizontal=True,
     )
 
+    # Input box
     user_input = st.chat_input("Type your message and press Enter")
 
     if user_input:
+        # Map to student ID
         student_id = "student_A" if speaker == "Student A" else "student_B"
 
         msg = Message(sender_id=student_id, sender_role="student", content=user_input)
@@ -154,13 +193,16 @@ def main():
             cga_frequency=4,
         )
 
+        # Update state
         st.session_state.casm = casm
         st.session_state.history = history
 
+        # Add student message
         st.session_state.chat.append(
             {"role": "student", "name": speaker, "text": user_input}
         )
 
+        # Add agent message if any
         if agent_resp:
             label = "Tutor" if agent_resp.agent_role == "pta" else "Facilitator"
             st.session_state.chat.append(
@@ -171,6 +213,7 @@ def main():
                 }
             )
 
+        # Log this turn
         record = {
             "timestamp": msg.timestamp,
             "student_id": msg.sender_id,
@@ -183,6 +226,7 @@ def main():
         with open(st.session_state.log_filename, "a") as f:
             f.write(json.dumps(record) + "\n")
 
+        # Refresh UI with new messages
         st.rerun()
 
 
