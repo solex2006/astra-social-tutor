@@ -1,15 +1,23 @@
 # run_astra.py
 
 import os
+import json
+from datetime import datetime
+
 from astra_backend import (
     LLMClient, CASMState, Message, handle_turn
 )
 
 from openai import OpenAI
 
+
 class OpenAILLMClient(LLMClient):
     def __init__(self, model: str = "gpt-4o-mini"):
-        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        # Read API key from environment variable
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY environment variable is not set.")
+        self.client = OpenAI(api_key=api_key)
         self.model = model
 
     def generate(self, system_prompt: str, user_prompt: str) -> str:
@@ -24,11 +32,23 @@ class OpenAILLMClient(LLMClient):
 
 
 def main():
+    # Check API key exists
     if "OPENAI_API_KEY" not in os.environ:
         print("Please set your OPENAI_API_KEY environment variable first.")
         return
 
     client = OpenAILLMClient()
+
+    # ---------- LOGGING SETUP ----------
+    # Create logs/ folder if it does not exist
+    os.makedirs("logs", exist_ok=True)
+
+    # Create a unique log filename for this run
+    log_filename = os.path.join(
+        "logs",
+        f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
+    )
+    # -----------------------------------
 
     casm = CASMState()
     history = []
@@ -66,6 +86,19 @@ def main():
             print(f"{label} [{agent_resp.action_tag}]: {agent_resp.content}\n")
         else:
             print("(No response from agent.)\n")
+
+        # ---------- LOG THIS TURN ----------
+        record = {
+            "timestamp": msg.timestamp,
+            "student_id": msg.sender_id,
+            "student_msg": msg.content,
+            "agent_role": agent_resp.agent_role if agent_resp else None,
+            "agent_action": agent_resp.action_tag if agent_resp else None,
+            "agent_msg": agent_resp.content if agent_resp else None,
+        }
+        with open(log_filename, "a") as f:
+            f.write(json.dumps(record) + "\n")
+        # -----------------------------------
 
 
 if __name__ == "__main__":
