@@ -1,4 +1,4 @@
-# Streamlit UI for ASTRA group tutor with two tasks and logging
+# Streamlit UI for ASTRA group tutor with multiple students and tasks
 
 import os
 import json
@@ -10,29 +10,17 @@ from openai import OpenAI
 from astra_backend import LLMClient, CASMState, Message, handle_turn
 
 
-# ---------- LLM CLIENT ----------
+# ---------- CONFIG: STUDENTS AND TASKS ----------
 
-class OpenAILLMClient(LLMClient):
-    def __init__(self, model: str = "gpt-4o-mini"):
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY environment variable is not set.")
-        self.client = OpenAI(api_key=api_key)
-        self.model = model
+# You can add or remove students here
+STUDENTS = {
+    "Student A": "student_A",
+    "Student B": "student_B",
+    "Student C": "student_C",
+    "Student D": "student_D",
+}
 
-    def generate(self, system_prompt: str, user_prompt: str) -> str:
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
-        return resp.choices[0].message.content
-
-
-# ---------- TASK DEFINITIONS ----------
-
+# You can add more tasks here by following the same structure
 TASKS = {
     "Task 1: Sum numbers from 1 to n": {
         "context": (
@@ -65,7 +53,45 @@ TASKS = {
             "Explain what this code currently does, why it is wrong, and how to fix it."
         ),
     },
+    "Task 3: Filter even numbers from a list": {
+        "context": (
+            "You are helping students write and debug a Python function that "
+            "filters even numbers from a list. Focus on list iteration and "
+            "conditional logic."
+        ),
+        "description": (
+            "You are working on this Python problem:\n\n"
+            "Write a function filter_evens(numbers) that returns a new list "
+            "containing only the even integers from the input list.\n\n"
+            "Example:\n"
+            "- filter_evens([1, 2, 3, 4]) -> [2, 4]\n"
+            "- filter_evens([5, 7, 9]) -> []\n\n"
+            "Discuss how you would design this function, and how you would test it "
+            "with different inputs."
+        ),
+    },
 }
+
+
+# ---------- LLM CLIENT ----------
+
+class OpenAILLMClient(LLMClient):
+    def __init__(self, model: str = "gpt-4o-mini"):
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY environment variable is not set.")
+        self.client = OpenAI(api_key=api_key)
+        self.model = model
+
+    def generate(self, system_prompt: str, user_prompt: str) -> str:
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        return resp.choices[0].message.content
 
 
 # ---------- INITIALISE SESSION STATE ----------
@@ -79,7 +105,8 @@ def init_state():
         st.session_state.client = OpenAILLMClient()
         st.session_state.casm = CASMState()
         st.session_state.history = []
-        st.session_state.participants = ["student_A", "student_B"]
+        # All student ids from STUDENTS mapping
+        st.session_state.participants = list(STUDENTS.values())
 
         st.session_state.selected_task = default_task
         st.session_state.task_context = TASKS[default_task]["context"]
@@ -91,7 +118,8 @@ def init_state():
             f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl",
         )
 
-        st.session_state.chat = []  # list of dicts: {role, name, text}
+        # Chat history: list of dicts {role, name, text}
+        st.session_state.chat = []
 
 
 # ---------- MAIN APP ----------
@@ -109,7 +137,7 @@ def main():
         )
         st.write(
             "- **Tutor** messages focus on hints, questions, and explanations.\n"
-            "- **Facilitator** messages focus on how you collaborate as a pair "
+            "- **Facilitator** messages focus on how you collaborate as a group "
             "(who speaks, who explains, whether you summarise, etc.)."
         )
         st.caption(
@@ -122,10 +150,10 @@ def main():
 
     st.markdown(
         "### How to use this tool\n\n"
-        "1. Work in a pair as **Student A** and **Student B**.\n"
+        "1. Work in a small group as **Student A, Student B, Student C, Student D** (or fewer).\n"
         "2. Select the programming task you are working on.\n"
         "3. Read the task description carefully.\n"
-        "4. Choose who is speaking (Student A or Student B).\n"
+        "4. Choose who is speaking before sending each message.\n"
         "5. Type your message explaining your thinking, code, or questions.\n"
         "6. The **Tutor** helps with the programming content; the **Facilitator** "
         "helps you collaborate effectively.\n\n"
@@ -156,10 +184,8 @@ def main():
         text = msg["text"]
 
         if role == "student":
-            # Student messages
             st.markdown(f"**{name}:** {text}")
         else:
-            # Tutor / Facilitator messages – highlight label
             st.markdown(
                 f"<span style='color:#1f4e79; font-weight:bold;'>{name}:</span> {text}",
                 unsafe_allow_html=True,
@@ -167,10 +193,12 @@ def main():
 
     st.markdown("---")
 
-    # Who is speaking now?
+    # Who is speaking now? (any of the configured students)
+    student_labels = list(STUDENTS.keys())
     speaker = st.radio(
         "Who is speaking?",
-        options=["Student A", "Student B"],
+        options=student_labels,
+        index=0,
         horizontal=True,
     )
 
@@ -178,8 +206,8 @@ def main():
     user_input = st.chat_input("Type your message and press Enter")
 
     if user_input:
-        # Map to student ID
-        student_id = "student_A" if speaker == "Student A" else "student_B"
+        # Map display name to internal student id
+        student_id = STUDENTS[speaker]
 
         msg = Message(sender_id=student_id, sender_role="student", content=user_input)
 
