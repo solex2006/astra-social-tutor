@@ -1,12 +1,13 @@
-# Streamlit UI for ASTRA group tutor with multiple students, tasks, conditions, and logging
-
 import os
 import json
+import io
+import csv
 from datetime import datetime
 
 import streamlit as st
 from openai import OpenAI
 
+from solution_logging import log_solution, load_solutions, log_grade, load_grades
 from astra_backend import LLMClient, CASMState, Message, handle_turn
 
 
@@ -70,9 +71,11 @@ TASKS = {
     },
 }
 
+# Three configurations matching the Methods section
 CONDITIONS = {
-    "Single-agent tutor (PTA only)": "pta_only",
-    "Multi-agent tutor (PTA + CGA)": "pta_cga",
+    "Alone + AI tutor (Individual–Single-Agent)": "alone_tutor",
+    "Pair + AI tutor (Pair–Single-Agent)": "pair_tutor",
+    "Pair + multi-agent tutor (Pair–Multi-Agent)": "pair_multiagent",
 }
 
 
@@ -97,7 +100,7 @@ class OpenAILLMClient(LLMClient):
         return resp.choices[0].message.content
 
 
-# ---------- INITIALISE SESSION STATE ----------
+# ---------- INITIALISE SESSION STATE (STUDENT MODE) ----------
 
 def init_state():
     if "initialised" not in st.session_state:
@@ -132,35 +135,22 @@ def init_state():
         # chat history for display: list of dicts {"role", "name", "text"}
         st.session_state.chat = []
 
+        # storage for final solution per task
+        st.session_state.solution_code = ""
 
-# ---------- MAIN APP ----------
+        # current unsent chat message
+        st.session_state.chat_message = ""
 
-def main():
-    st.set_page_config(page_title="ASTRA Group Tutor", page_icon="🧠")
-    init_state()
 
-    # Sidebar with study info
-    with st.sidebar:
-        st.header("About ASTRA")
-        st.write(
-            "You are interacting with ASTRA, a socially intelligent AI tutor "
-            "designed to support small groups working on programming problems."
-        )
-        st.write(
-            "- Tutor messages focus on hints, questions, and explanations.\n"
-            "- Facilitator messages focus on how you collaborate as a group "
-            "(who speaks, who explains, whether you summarise, etc.)."
-        )
-        st.caption(
-            "Please avoid sharing personal or sensitive information. "
-            "Your interactions may be logged for research and evaluation."
-        )
+# ---------- STUDENT UI ----------
 
+def run_student_ui():
     st.title("ASTRA Group Tutor 🧠")
 
     st.markdown(
         "### Session setup\n\n"
-        "Before you start, please enter your group identifier and confirm your condition."
+        "Before you start, please enter your group identifier and choose the configuration "
+        "assigned by the instructor (alone vs pair, and whether you see a multi-agent tutor)."
     )
 
     # Group ID and condition selection (for the researcher / instructor)
@@ -172,7 +162,7 @@ def main():
         )
     with col2:
         condition_label = st.selectbox(
-            "Condition",
+            "Collaboration configuration",
             options=list(CONDITIONS.keys()),
             index=list(CONDITIONS.keys()).index(st.session_state.condition_label),
         )
@@ -184,14 +174,15 @@ def main():
 
     st.markdown(
         "### How to use this tool\n\n"
-        "1. Work in a small group as Student A, Student B, Student C and Student D (or fewer).\n"
+        "1. Work **alone or in a pair** according to the configuration shown above.\n"
         "2. Select the programming task you are working on.\n"
         "3. Read the task description carefully.\n"
         "4. Choose who is speaking before sending each message.\n"
         "5. Type your message explaining your thinking, code, or questions.\n"
-        "6. The Tutor helps with the programming content; the Facilitator "
-        "helps you collaborate effectively.\n\n"
-        "Try to explain your reasoning to each other, not just ask for the final answer."
+        "6. The Tutor helps with the programming content; in the multi-agent condition, "
+        "the Facilitator helps you collaborate effectively.\n\n"
+        "Try to explain your reasoning to each other (or to yourself, if working alone), "
+        "not just ask for the final answer."
     )
 
     # ----- Task selection and description -----
@@ -208,25 +199,11 @@ def main():
         st.session_state.selected_task = selected_task
         st.session_state.task_context = TASKS[selected_task]["context"]
         st.session_state.task_description = TASKS[selected_task]["description"]
+        # Reset solution text when switching tasks
+        st.session_state.solution_code = ""
 
     st.subheader("Current programming task")
     st.text(st.session_state.task_description)
-
-    st.markdown("---")
-
-    # Show chat history
-    for msg in st.session_state.chat:
-        role = msg["role"]
-        name = msg.get("name", "")
-        text = msg["text"]
-
-        if role == "student":
-            st.markdown(f"**{name}:** {text}")
-        else:
-            st.markdown(
-                f"<span style='color:#1f4e79; font-weight:bold;'>{name}:</span> {text}",
-                unsafe_allow_html=True,
-            )
 
     st.markdown("---")
 
@@ -239,65 +216,284 @@ def main():
         horizontal=True,
     )
 
-    user_input = st.chat_input("Type your message and press Enter")
+    # Chat input (positioned BEFORE transcript and final solution box)
+    st.subheader("Chat with the tutor (and facilitator, if enabled)")
+    st.session_state.chat_message = st.text_input(
+        "Type your message and click 'Send message'",
+        value=st.session_state.chat_message,
+        key="chat_message_input",
+    )
+    send_clicked = st.button("Send message")
 
-    if user_input:
-        student_id = STUDENTS[speaker]
+    # -------------------------------------------------
+    # Handle chat message first (so transcript below reflects updates)
+    # -------------------------------------------------
+    if send_clicked:
+        user_input = st.session_state.chat_message.strip()
+        if user_input:
+            student_id = STUDENTS[speaker]
+            msg = Message(sender_id=student_id, sender_role="student", content=user_input)
 
-        msg = Message(sender_id=student_id, sender_role="student", content=user_input)
+            # Decide CGA frequency based on condition:
+            # Only the pair + multi-agent tutor condition activates the Facilitator.
+            if st.session_state.condition_code == "pair_multiagent":
+                cga_frequency = 4
+            else:
+                # Use a very large number so the Facilitator never fires in realistic sessions
+                cga_frequency = 10**9
 
-        # Decide CGA frequency based on condition
-        if st.session_state.condition_code == "pta_only":
-            cga_frequency = None
-        else:
-            cga_frequency = 4
+            # Show spinner while the tutor responds
+            with st.spinner("Tutor is thinking..."):
+                try:
+                    casm, history, agent_resp = handle_turn(
+                        client=st.session_state.client,
+                        new_message=msg,
+                        history=st.session_state.history,
+                        casm=st.session_state.casm,
+                        participant_ids=st.session_state.participants,
+                        task_context=st.session_state.task_context,
+                        cga_frequency=cga_frequency,
+                    )
+                except Exception as e:
+                    st.error(
+                        "An error occurred while generating the tutor response. "
+                        f"Details: {e}"
+                    )
+                    return
 
-        casm, history, agent_resp = handle_turn(
-            client=st.session_state.client,
-            new_message=msg,
-            history=st.session_state.history,
-            casm=st.session_state.casm,
-            participant_ids=st.session_state.participants,
-            task_context=st.session_state.task_context,
-            cga_frequency=cga_frequency,
-        )
+            st.session_state.casm = casm
+            st.session_state.history = history
 
-        st.session_state.casm = casm
-        st.session_state.history = history
-
-        # Add student message to display
-        st.session_state.chat.append(
-            {"role": "student", "name": speaker, "text": user_input}
-        )
-
-        # Add agent message to display
-        if agent_resp:
-            label = "Tutor" if agent_resp.agent_role == "pta" else "Facilitator"
+            # Add student message to display
             st.session_state.chat.append(
-                {
-                    "role": "agent",
-                    "name": f"{label} [{agent_resp.action_tag}]",
-                    "text": agent_resp.content,
-                }
+                {"role": "student", "name": speaker, "text": user_input}
             )
 
-        # Log this turn
-        record = {
-            "timestamp": msg.timestamp,
-            "group_id": st.session_state.group_id,
-            "condition": st.session_state.condition_code,
-            "student_id": msg.sender_id,
-            "student_label": speaker,
-            "student_msg": msg.content,
-            "agent_role": agent_resp.agent_role if agent_resp else None,
-            "agent_action": agent_resp.action_tag if agent_resp else None,
-            "agent_msg": agent_resp.content if agent_resp else None,
-            "task_name": st.session_state.selected_task,
-        }
-        with open(st.session_state.log_filename, "a") as f:
-            f.write(json.dumps(record) + "\n")
+            # Add agent message to display
+            if agent_resp:
+                label = "Tutor" if agent_resp.agent_role == "pta" else "Facilitator"
+                st.session_state.chat.append(
+                    {
+                        "role": "agent",
+                        "name": f"{label} [{agent_resp.action_tag}]",
+                        "text": agent_resp.content,
+                    }
+                )
 
-        st.rerun()
+            # Log this turn
+            record = {
+                "timestamp": msg.timestamp,
+                "group_id": st.session_state.group_id,
+                "configuration": st.session_state.condition_code,
+                "student_id": msg.sender_id,
+                "student_label": speaker,
+                "student_msg": msg.content,
+                "agent_role": agent_resp.agent_role if agent_resp else None,
+                "agent_action": agent_resp.action_tag if agent_resp else None,
+                "agent_msg": agent_resp.content if agent_resp else None,
+                "task_name": st.session_state.selected_task,
+            }
+            with open(st.session_state.log_filename, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+
+            # Clear chat input for next message
+            st.session_state.chat_message = ""
+
+            st.rerun()
+
+    # -------------------------------------------------
+    # Conversation transcript (now BELOW the send button)
+    # -------------------------------------------------
+    st.markdown("---")
+    st.subheader("Conversation so far")
+
+    if not st.session_state.chat:
+        st.caption("No messages yet. Start by sending a question or idea above.")
+    else:
+        for msg in st.session_state.chat:
+            role = msg["role"]
+            name = msg.get("name", "")
+            text = msg["text"]
+
+            if role == "student":
+                st.markdown(f"**{name}:** {text}")
+            else:
+                st.markdown(
+                    f"<span style='color:#1f4e79; font-weight:bold;'>{name}:</span> {text}",
+                    unsafe_allow_html=True,
+                )
+
+    # -------------------------------------------------
+    # Final solution capture for the CURRENT task
+    # -------------------------------------------------
+    st.markdown("---")
+    st.subheader("Final solution for this task")
+
+    st.session_state.solution_code = st.text_area(
+        "Paste or type your FINAL code for the CURRENT task here.\n"
+        "When you are happy with it, click 'Submit final solution'.",
+        value=st.session_state.solution_code,
+        height=200,
+        key="solution_code_area",
+    )
+
+    if st.button("💾 Submit final solution for this task"):
+        group_id = st.session_state.group_id.strip()
+        configuration = st.session_state.condition_code.strip()
+        task_id = st.session_state.selected_task.strip()
+        code = st.session_state.solution_code
+
+        if not group_id:
+            st.warning("Please set a Group ID at the top before submitting a solution.")
+        elif not configuration:
+            st.warning("Please set the configuration before submitting.")
+        elif not task_id:
+            st.warning("Please select a task before submitting a solution.")
+        elif not code.strip():
+            st.warning("Please enter some code before submitting.")
+        else:
+            log_solution(
+                group_id=group_id,
+                configuration=configuration,
+                task_id=task_id,
+                solution_code=code,
+            )
+            st.success(
+                f"Final solution saved for group {group_id}, task '{task_id}'. "
+                "You can still edit and submit again; only the latest submission "
+                "will be used during grading."
+            )
+
+
+# ---------- MARKER UI ----------
+
+def run_marker_ui():
+    st.title("ASTRA – Marker view for grading solutions")
+
+    st.markdown(
+        "This view lets you review and grade final solutions submitted "
+        "through the ASTRA tutor, and export a summary of grades."
+    )
+
+    solutions = load_solutions()
+    if not solutions:
+        st.info("No solutions have been submitted yet. "
+                "Run the Student mode with learners first.")
+        return
+
+    # Build a list of unique (group_id, task_id) combinations
+    unique_pairs = sorted({(s['group_id'], s['task_id']) for s in solutions})
+
+    label_map = {
+        (g, t): f"{g} – {t}"
+        for (g, t) in unique_pairs
+    }
+    labels = [label_map[p] for p in unique_pairs]
+
+    st.subheader("1. Choose a group and task")
+    selected_label = st.selectbox("Group and task", options=labels)
+
+    # Recover (group_id, task_id) from label
+    sel_group, sel_task = selected_label.split(" – ", 1)
+
+    # Filter submissions for this group+task
+    submissions = [
+        s for s in solutions
+        if s["group_id"] == sel_group and s["task_id"] == sel_task
+    ]
+    # Take the most recent as the final one
+    solution = submissions[-1]
+
+    st.markdown("### 2. Inspect final code")
+    st.markdown(f"**Group:** {sel_group}  \n**Task:** `{sel_task}`")
+    st.code(solution["solution_code"], language="python")
+
+    st.markdown("### 3. Assign rubric score")
+    st.markdown(
+        "- **0** – Incorrect or no viable solution\n"
+        "- **1** – Partially correct solution (core idea present, minor errors)\n"
+        "- **2** – Fully correct solution"
+    )
+
+    score = st.radio(
+        "Score",
+        options=[0, 1, 2],
+        index=1,
+        horizontal=True,
+    )
+
+    comments = st.text_area(
+        "Optional comments (for your analysis, not shown to students):",
+        height=120,
+    )
+
+    if st.button("✅ Save grade"):
+        log_grade(
+            group_id=sel_group,
+            task_id=sel_task,
+            score=score,
+            comments=comments.strip(),
+        )
+        st.success("Grade saved to logs/grades.jsonl.")
+
+    # ---------- Export summary ----------
+    st.markdown("---")
+    st.subheader("4. Export grades summary")
+
+    grades = load_grades()
+    if not grades:
+        st.info("No grades have been recorded yet.")
+        return
+
+    # Build CSV from grades
+    output = io.StringIO()
+    fieldnames = ["timestamp", "group_id", "task_id", "score", "comments"]
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    for g in grades:
+        row = {fn: g.get(fn, "") for fn in fieldnames}
+        writer.writerow(row)
+
+    csv_bytes = output.getvalue().encode("utf-8")
+
+    st.download_button(
+        "⬇️ Download grades as CSV",
+        data=csv_bytes,
+        file_name="astra_grades_summary.csv",
+        mime="text/csv",
+    )
+
+
+# ---------- MAIN APP ----------
+
+def main():
+    st.set_page_config(page_title="ASTRA Group Tutor", page_icon="🧠")
+
+    # Sidebar shared across modes
+    with st.sidebar:
+        mode = st.radio("Mode", ["Student", "Marker"], index=0)
+        st.header("About ASTRA")
+        st.write(
+            "You are interacting with ASTRA, a socially intelligent AI tutor "
+            "designed to support individuals and small groups working on "
+            "introductory programming problems."
+        )
+        st.write(
+            "- In all conditions, the Tutor focuses on hints, questions, and explanations.\n"
+            "- In the multi-agent condition, the Facilitator focuses on how the pair "
+            "collaborates (who speaks, who explains, whether you summarise, etc.)."
+        )
+        st.caption(
+            "Please avoid sharing personal or sensitive information. "
+            "Your interactions and submitted solutions may be logged for "
+            "research and evaluation."
+        )
+
+    if mode == "Student":
+        init_state()
+        run_student_ui()
+    else:
+        run_marker_ui()
 
 
 if __name__ == "__main__":
